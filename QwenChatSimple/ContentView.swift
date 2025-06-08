@@ -3,51 +3,65 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var llmEngine = LLMEngine.shared
+    @StateObject private var modelDownloader = ModelDownloader()
     @State private var inputText = ""
-    @State private var messages: [Message] = [
-        Message(content: "こんにちは！Qwen3-1.7Bチャットアプリへようこそ。", isUser: false)
-    ]
+    @State private var messages: [Message] = []
     @State private var showFilePicker = false
     @State private var showingAlert = false
     @State private var alertMessage = ""
     @State private var currentTask: Task<Void, Never>?
+    @State private var showDownloadView = false
+    @State private var showWelcome = false
     
     var body: some View {
         NavigationView {
             VStack {
                 // モデル状態表示
-                HStack {
-                    Image(systemName: llmEngine.isModelLoaded ? "checkmark.circle.fill" : "exclamationmark.circle")
-                        .foregroundColor(llmEngine.isModelLoaded ? .green : .orange)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(llmEngine.isModelLoaded ? "モデル読み込み済み" : "モデル未読み込み")
-                            .font(.caption)
-                        if llmEngine.isModelLoaded {
-                            Text("\(llmEngine.modelInfo.name) (\(llmEngine.modelInfo.size))")
+                VStack(spacing: 8) {
+                    HStack {
+                        Image(systemName: llmEngine.isModelLoaded ? "checkmark.circle.fill" : "exclamationmark.circle")
+                            .foregroundColor(llmEngine.isModelLoaded ? .green : .orange)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(llmEngine.isModelLoaded ? "モデル読み込み済み" : "モデル未読み込み")
+                                .font(.caption)
+                            if llmEngine.isModelLoaded {
+                                Text("\(llmEngine.modelInfo.name) (\(llmEngine.modelInfo.size))")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        Spacer()
+                        
+                        // システム情報ボタン
+                        Button("📊") {
+                            showSystemInfo()
+                        }
+                        .font(.caption)
+                        .padding(.trailing, 4)
+                        
+                        // テストボタン
+                        Button("🧪") {
+                            runQuickTest()
+                        }
+                        .font(.caption)
+                        .padding(.trailing, 4)
+                        
+                        Button("ダウンロード") {
+                            showDownloadView = true
+                        }
+                        .font(.caption)
+                    }
+                    
+                    // ダウンロード進行状況
+                    if modelDownloader.isDownloading {
+                        VStack(spacing: 4) {
+                            ProgressView(value: modelDownloader.downloadProgress)
+                                .progressViewStyle(LinearProgressViewStyle())
+                            Text(modelDownloader.statusMessage)
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
                         }
                     }
-                    Spacer()
-                    
-                    // システム情報ボタン
-                    Button("📊") {
-                        showSystemInfo()
-                    }
-                    .font(.caption)
-                    .padding(.trailing, 4)
-                    
-                    // テストボタン
-                    Button("🧪") {
-                        runQuickTest()
-                    }
-                    .font(.caption)
-                    .padding(.trailing, 4)
-                    
-                    Button("モデル選択") {
-                        showFilePicker = true
-                    }
-                    .font(.caption)
                 }
                 .padding(.horizontal)
                 .padding(.top, 8)
@@ -110,13 +124,19 @@ struct ContentView: View {
         ) { result in
             handleFileImport(result)
         }
+        .sheet(isPresented: $showDownloadView) {
+            ModelDownloadView(downloader: modelDownloader, llmEngine: llmEngine)
+        }
+        .fullScreenCover(isPresented: $showWelcome) {
+            WelcomeView(downloader: modelDownloader, llmEngine: llmEngine)
+        }
         .alert("エラー", isPresented: $showingAlert) {
             Button("OK", role: .cancel) { }
         } message: {
             Text(alertMessage)
         }
         .onAppear {
-            checkForBundledModel()
+            checkFirstLaunch()
         }
     }
     
@@ -170,14 +190,29 @@ struct ContentView: View {
         llmEngine.stopGeneration()
     }
     
-    func checkForBundledModel() {
-        // バンドル内のモデルファイルをチェック
-        if let bundlePath = Bundle.main.path(forResource: "qwen2.5-0.5b-instruct-q4_k_m", ofType: "gguf") {
+    func checkFirstLaunch() {
+        modelDownloader.checkModelAvailability()
+        
+        // 初回起動時はWelcomeViewを表示（hasSeenWelcomeフラグでチェック）
+        if !UserDefaults.standard.bool(forKey: "hasSeenWelcome") {
+            showWelcome = true
+            return
+        }
+        
+        // モデルが利用可能な場合は通常の起動処理
+        checkModelAvailability()
+    }
+    
+    func checkModelAvailability() {
+        modelDownloader.checkModelAvailability()
+        
+        if modelDownloader.isModelAvailable {
+            // ダウンロードされたモデルをロード
             Task {
                 do {
-                    try await llmEngine.loadModel(from: bundlePath)
+                    try await llmEngine.loadModelFromDownloader(modelDownloader)
                     messages.append(Message(
-                        content: "バンドル内のモデルを読み込みました。",
+                        content: "こんにちは！Qwen3-1.7Bチャットアプリへようこそ。ダウンロードされたモデルを読み込みました。",
                         isUser: false
                     ))
                 } catch {
@@ -188,10 +223,28 @@ struct ContentView: View {
                 }
             }
         } else {
-            messages.append(Message(
-                content: "モデルファイルが見つかりません。「モデル選択」ボタンからGGUFファイルを選択するか、以下のURLからダウンロードしてください:\nhttps://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF",
-                isUser: false
-            ))
+            // バンドル内のモデルファイルをチェック（フォールバック）
+            if let bundlePath = Bundle.main.path(forResource: "qwen3-1.7b-q4_0", ofType: "gguf") {
+                Task {
+                    do {
+                        try await llmEngine.loadModel(from: bundlePath)
+                        messages.append(Message(
+                            content: "こんにちは！Qwen3-1.7Bチャットアプリへようこそ。バンドル内のモデルを読み込みました。",
+                            isUser: false
+                        ))
+                    } catch {
+                        messages.append(Message(
+                            content: "モデル読み込みエラー: \(error.localizedDescription)",
+                            isUser: false
+                        ))
+                    }
+                }
+            } else {
+                messages.append(Message(
+                    content: "モデルファイルが見つかりません。「ダウンロード」ボタンからQwen3-1.7Bモデルをダウンロードしてください。",
+                    isUser: false
+                ))
+            }
         }
     }
     
